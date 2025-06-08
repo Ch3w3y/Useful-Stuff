@@ -1,0 +1,95 @@
+version: '3.8'
+
+services:
+  pytorch-gpu:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pytorch-ml-gpu
+    
+    # GPU Configuration
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    
+    # Runtime configuration (alternative GPU setup)
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=compute,utility
+    
+    # Port mapping
+    ports:
+      - "8888:8888"      # Jupyter Lab
+      - "6006:6006"      # TensorBoard
+      - "5000:5000"      # MLflow
+      - "8080:8080"      # Additional services
+    
+    # Volume mounts
+    volumes:
+      - ./data:/workspace/data
+      - ./notebooks:/workspace/notebooks
+      - ./models:/workspace/models
+      - ./experiments:/workspace/experiments
+      - ./scripts:/workspace/scripts
+      # Host machine integration
+      - ~/.ssh:/root/.ssh:ro
+      - ~/.gitconfig:/root/.gitconfig:ro
+    
+    # Environment variables
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - PYTHONPATH=/workspace
+      - CUDA_VISIBLE_DEVICES=0,1  # Adjust based on your GPUs
+      
+    # Resource limits
+    shm_size: '2gb'
+    
+    # Network
+    networks:
+      - ml-network
+    
+    # Restart policy
+    restart: unless-stopped
+    
+    # Keep container running
+    stdin_open: true
+    tty: true
+
+  # Optional: Separate TensorBoard service
+  tensorboard:
+    image: tensorflow/tensorflow:latest
+    container_name: tensorboard-service
+    command: tensorboard --logdir=/logs --host=0.0.0.0 --port=6006
+    ports:
+      - "6007:6006"
+    volumes:
+      - ./experiments/logs:/logs
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+  # Optional: MLflow tracking server
+  mlflow:
+    image: python:3.9-slim
+    container_name: mlflow-server
+    command: >
+      bash -c "pip install mlflow && 
+               mlflow server --host 0.0.0.0 --port 5000 
+               --default-artifact-root /mlflow/artifacts
+               --backend-store-uri /mlflow/mlruns"
+    ports:
+      - "5001:5000"
+    volumes:
+      - ./mlflow:/mlflow
+    networks:
+      - ml-network
+    restart: unless-stopped
+
+networks:
+  ml-network:
+    driver: bridge 

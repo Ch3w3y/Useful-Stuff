@@ -1,0 +1,40 @@
+# GCP Project Configuration
+# Copy this file to .env and fill in your actual values
+
+# Project Settings
+GCP_PROJECT_ID=your-project-id
+GCP_REGION=us-central1
+GCP_ZONE=us-central1-a
+
+# Storage Configuration
+GCS_INPUT_BUCKET=your-input-bucket
+GCS_OUTPUT_BUCKET=your-output-bucket
+GCS_LOGS_BUCKET=your-logs-bucket
+
+# Service Account Configuration
+GOOGLE_APPLICATION_CREDENTIALS=/app/config/service-account-key.json
+GCP_SERVICE_ACCOUNT_EMAIL=r-script-runner@your-project-id.iam.gserviceaccount.com
+
+# BigQuery Configuration
+BQ_DATASET_ID=your_dataset
+BQ_TABLE_PREFIX=analysis_
+BQ_LOCATION=US
+
+# Script Configuration
+TARGET_SCRIPT=scripts/main-analysis.R
+LOG_LEVEL=INFO
+NOTIFICATION_EMAIL=your-email@domain.com
+
+# Security Settings
+ENVIRONMENT=production
+DEBUG_MODE=false
+ENABLE_LOGGING=true
+
+# Optional: Slack Notifications
+SLACK_WEBHOOK_URL=https://hooks.slack.com/services/YOUR/SLACK/WEBHOOK
+
+# Optional: Email Configuration
+SMTP_SERVER=smtp.gmail.com
+SMTP_PORT=587
+SMTP_USERNAME=your-smtp-username
+SMTP_PASSWORD=your-smtp-password 
