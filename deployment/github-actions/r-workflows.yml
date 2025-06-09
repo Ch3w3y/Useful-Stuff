@@ -1,0 +1,402 @@
+# R Application CI/CD Workflows
+# Comprehensive GitHub Actions for R packages, APIs, and deployments
+
+name: R CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths: [ '**.R', '**.Rmd', 'renv.lock', 'DESCRIPTION' ]
+  pull_request:
+    branches: [ main ]
+  release:
+    types: [ published ]
+
+env:
+  R_VERSION: '4.3.2'
+  GITHUB_PAT: ${{ secrets.GITHUB_TOKEN }}
+
+jobs:
+  # R Package Testing
+  r-check:
+    runs-on: ${{ matrix.config.os }}
+    name: ${{ matrix.config.os }} (R-${{ matrix.config.r }})
+    
+    strategy:
+      fail-fast: false
+      matrix:
+        config:
+          - {os: ubuntu-latest,   r: 'release'}
+          - {os: ubuntu-latest,   r: 'devel'}
+          - {os: windows-latest,  r: 'release'}
+          - {os: macOS-latest,    r: 'release'}
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup R
+      uses: r-lib/actions/setup-r@v2
+      with:
+        r-version: ${{ matrix.config.r }}
+        use-public-rspm: true
+
+    - name: Setup Pandoc
+      uses: r-lib/actions/setup-pandoc@v2
+
+    - name: Install system dependencies (Linux)
+      if: runner.os == 'Linux'
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          libcurl4-openssl-dev \
+          libxml2-dev \
+          libssl-dev \
+          libpq-dev \
+          libgit2-dev \
+          libharfbuzz-dev \
+          libfribidi-dev
+
+    - name: Cache R packages
+      uses: actions/cache@v3
+      with:
+        path: ${{ env.R_LIBS_USER }}
+        key: ${{ runner.os }}-R${{ matrix.config.r }}-${{ hashFiles('renv.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-R${{ matrix.config.r }}-
+
+    - name: Install renv and restore packages
+      run: |
+        if (!requireNamespace("renv", quietly = TRUE)) install.packages("renv")
+        renv::restore()
+      shell: Rscript {0}
+
+    - name: Check R package
+      if: contains(matrix.config.os, 'ubuntu') && matrix.config.r == 'release'
+      run: |
+        if (file.exists("DESCRIPTION")) {
+          install.packages("rcmdcheck")
+          rcmdcheck::rcmdcheck(args = c("--no-manual", "--as-cran"), error_on = "warning")
+        } else {
+          cat("No DESCRIPTION file found, skipping package check\n")
+        }
+      shell: Rscript {0}
+
+    - name: Run tests
+      run: |
+        if (file.exists("tests/testthat.R")) {
+          if (!requireNamespace("testthat", quietly = TRUE)) install.packages("testthat")
+          testthat::test_local()
+        } else {
+          cat("No tests found\n")
+        }
+      shell: Rscript {0}
+
+    - name: Test coverage
+      if: matrix.config.os == 'ubuntu-latest' && matrix.config.r == 'release'
+      run: |
+        if (file.exists("tests/testthat.R")) {
+          if (!requireNamespace("covr", quietly = TRUE)) install.packages("covr")
+          covr::codecov(token = "${{ secrets.CODECOV_TOKEN }}")
+        }
+      shell: Rscript {0}
+
+  # Linting and Code Quality
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup R
+      uses: r-lib/actions/setup-r@v2
+      with:
+        r-version: ${{ env.R_VERSION }}
+
+    - name: Install lintr
+      run: |
+        install.packages("lintr")
+      shell: Rscript {0}
+
+    - name: Lint R code
+      run: |
+        lints <- lintr::lint_package()
+        print(lints)
+        if (length(lints) > 0) {
+          quit(status = 1)
+        }
+      shell: Rscript {0}
+
+  # Docker Build and Test
+  docker-build:
+    runs-on: ubuntu-latest
+    needs: [r-check, lint]
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tags }}
+      image-digest: ${{ steps.build.outputs.digest }}
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+
+    - name: Extract metadata
+      id: meta
+      uses: docker/metadata-action@v5
+      with:
+        images: ghcr.io/${{ github.repository }}
+        tags: |
+          type=ref,event=branch
+          type=ref,event=pr
+          type=semver,pattern={{version}}
+          type=semver,pattern={{major}}.{{minor}}
+          type=sha,prefix={{branch}}-
+
+    - name: Build and push Docker image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        platforms: linux/amd64,linux/arm64
+        push: ${{ github.event_name != 'pull_request' }}
+        tags: ${{ steps.meta.outputs.tags }}
+        labels: ${{ steps.meta.outputs.labels }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        target: production
+
+    - name: Test Docker image
+      run: |
+        docker run --rm --name test-container -d \
+          -p 8000:8000 \
+          ${{ steps.meta.outputs.tags }}
+        
+        # Wait for container to start
+        sleep 10
+        
+        # Test health endpoint
+        curl -f http://localhost:8000/health || exit 1
+        
+        # Cleanup
+        docker stop test-container
+
+  # Security Scanning
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: docker-build
+    if: github.event_name != 'pull_request'
+    
+    steps:
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        image-ref: ${{ needs.docker-build.outputs.image-tag }}
+        format: 'sarif'
+        output: 'trivy-results.sarif'
+
+    - name: Upload Trivy scan results to GitHub Security tab
+      uses: github/codeql-action/upload-sarif@v2
+      with:
+        sarif_file: 'trivy-results.sarif'
+
+  # Deploy to GCP Cloud Run
+  deploy-gcp:
+    runs-on: ubuntu-latest
+    needs: [docker-build, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Authenticate to Google Cloud
+      uses: google-github-actions/auth@v1
+      with:
+        credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+    - name: Set up Cloud SDK
+      uses: google-github-actions/setup-gcloud@v1
+
+    - name: Deploy to Cloud Run
+      run: |
+        gcloud run deploy r-api \
+          --image ${{ needs.docker-build.outputs.image-tag }} \
+          --platform managed \
+          --region us-central1 \
+          --allow-unauthenticated \
+          --memory 2Gi \
+          --cpu 2 \
+          --max-instances 20 \
+          --set-env-vars R_ENV=production \
+          --set-env-vars PORT=8080 \
+          --set-cloudsql-instances ${{ secrets.CLOUD_SQL_CONNECTION_NAME }} \
+          --service-account ${{ secrets.CLOUD_RUN_SA_EMAIL }}
+
+    - name: Update traffic
+      run: |
+        gcloud run services update-traffic r-api \
+          --to-latest \
+          --region us-central1
+
+  # Deploy to AWS ECS
+  deploy-aws:
+    runs-on: ubuntu-latest
+    needs: [docker-build, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-west-2
+
+    - name: Deploy to ECS
+      run: |
+        # Update ECS service with new image
+        aws ecs update-service \
+          --cluster r-cluster \
+          --service r-api-service \
+          --force-new-deployment \
+          --task-definition r-api-task:${{ github.run_number }}
+
+  # Deploy to Kubernetes
+  deploy-k8s:
+    runs-on: ubuntu-latest
+    needs: [docker-build, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    environment: production
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup kubectl
+      uses: azure/setup-kubectl@v3
+      with:
+        version: 'v1.28.0'
+
+    - name: Configure kubeconfig
+      run: |
+        echo "${{ secrets.KUBECONFIG }}" | base64 -d > $HOME/.kube/config
+
+    - name: Deploy to Kubernetes
+      run: |
+        # Update deployment with new image
+        kubectl set image deployment/r-api \
+          r-api=${{ needs.docker-build.outputs.image-tag }} \
+          --namespace=production
+        
+        # Wait for rollout to complete
+        kubectl rollout status deployment/r-api --namespace=production
+        
+        # Verify deployment
+        kubectl get pods --namespace=production -l app=r-api
+
+  # Performance Testing
+  performance-test:
+    runs-on: ubuntu-latest
+    needs: deploy-gcp
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup R for load testing
+      uses: r-lib/actions/setup-r@v2
+      with:
+        r-version: ${{ env.R_VERSION }}
+
+    - name: Install testing packages
+      run: |
+        install.packages(c("httr", "parallel", "microbenchmark"))
+      shell: Rscript {0}
+
+    - name: Run load test
+      run: |
+        library(httr)
+        library(parallel)
+        
+        # Get service URL
+        service_url <- "${{ secrets.SERVICE_URL }}"
+        
+        # Load test function
+        load_test <- function(n_requests = 100, concurrent = 10) {
+          
+          test_request <- function(i) {
+            start_time <- Sys.time()
+            
+            response <- POST(
+              paste0(service_url, "/predict"),
+              body = list(features = list(x = runif(1), y = runif(1))),
+              encode = "json",
+              timeout(30)
+            )
+            
+            end_time <- Sys.time()
+            
+            list(
+              status = status_code(response),
+              duration = as.numeric(difftime(end_time, start_time, units = "secs")),
+              success = status_code(response) == 200
+            )
+          }
+          
+          # Run concurrent requests
+          results <- mclapply(1:n_requests, test_request, mc.cores = concurrent)
+          
+          # Analyze results
+          durations <- sapply(results, function(x) x$duration)
+          success_rate <- mean(sapply(results, function(x) x$success))
+          
+          cat("Load Test Results:\n")
+          cat("Success Rate:", success_rate * 100, "%\n")
+          cat("Mean Response Time:", mean(durations), "seconds\n")
+          cat("95th Percentile:", quantile(durations, 0.95), "seconds\n")
+          cat("Max Response Time:", max(durations), "seconds\n")
+          
+          # Fail if success rate < 95% or 95th percentile > 5 seconds
+          if (success_rate < 0.95 || quantile(durations, 0.95) > 5) {
+            quit(status = 1)
+          }
+        }
+        
+        load_test(100, 10)
+      shell: Rscript {0}
+
+  # Notification
+  notify:
+    runs-on: ubuntu-latest
+    needs: [deploy-gcp, deploy-aws, deploy-k8s, performance-test]
+    if: always()
+    
+    steps:
+    - name: Notify Slack
+      if: failure()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        
+    - name: Notify Slack on success
+      if: success()
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        channel: '#deployments'
+        webhook_url: ${{ secrets.SLACK_WEBHOOK }}
+        text: 'R API successfully deployed to production! 🚀' 
