@@ -1,0 +1,433 @@
+# Distributed Training Examples for Kubernetes
+# This file contains examples for running distributed ML training jobs
+
+# PyTorch Distributed Training with DistributedDataParallel
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: pytorch-distributed-training
+  labels:
+    app: pytorch-training
+    framework: pytorch
+spec:
+  parallelism: 4  # Number of worker pods
+  completions: 1
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: pytorch-training
+        framework: pytorch
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: pytorch-worker
+        image: pytorch/pytorch:2.1.0-cuda12.1-cudnn8-devel
+        command: ["python", "-m", "torch.distributed.launch"]
+        args: 
+          - "--nproc_per_node=1"
+          - "--nnodes=4"
+          - "--node_rank=$(MY_RANK)"
+          - "--master_addr=$(MASTER_ADDR)"
+          - "--master_port=23456"
+          - "train_distributed.py"
+        env:
+        - name: MY_RANK
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: MASTER_ADDR
+          value: "pytorch-distributed-training-0"
+        - name: WORLD_SIZE
+          value: "4"
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+            memory: "16Gi"
+            cpu: "4"
+          limits:
+            nvidia.com/gpu: 1
+            memory: "32Gi"
+            cpu: "8"
+        volumeMounts:
+        - name: training-data
+          mountPath: /data
+        - name: model-output
+          mountPath: /models
+        - name: shared-memory
+          mountPath: /dev/shm
+      volumes:
+      - name: training-data
+        persistentVolumeClaim:
+          claimName: training-data-pvc
+      - name: model-output
+        persistentVolumeClaim:
+          claimName: model-output-pvc
+      - name: shared-memory
+        emptyDir:
+          medium: Memory
+          sizeLimit: 1Gi
+
+---
+# TensorFlow MultiWorkerMirroredStrategy Training
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: tensorflow-distributed-training
+  labels:
+    app: tensorflow-training
+    framework: tensorflow
+spec:
+  parallelism: 3  # Chief + 2 workers
+  completions: 1
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: tensorflow-training
+        framework: tensorflow
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: tensorflow-worker
+        image: tensorflow/tensorflow:2.15.0-gpu
+        command: ["python", "train_multiworker.py"]
+        env:
+        - name: TF_CONFIG
+          value: |
+            {
+              "cluster": {
+                "worker": [
+                  "tensorflow-distributed-training-0:2222",
+                  "tensorflow-distributed-training-1:2222",
+                  "tensorflow-distributed-training-2:2222"
+                ]
+              },
+              "task": {
+                "type": "worker",
+                "index": $(TASK_INDEX)
+              }
+            }
+        - name: TASK_INDEX
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+        - name: CUDA_VISIBLE_DEVICES
+          value: "0"
+        ports:
+        - containerPort: 2222
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+            memory: "16Gi"
+            cpu: "4"
+          limits:
+            nvidia.com/gpu: 1
+            memory: "32Gi"
+            cpu: "8"
+        volumeMounts:
+        - name: training-data
+          mountPath: /data
+        - name: model-output
+          mountPath: /models
+      volumes:
+      - name: training-data
+        persistentVolumeClaim:
+          claimName: training-data-pvc
+      - name: model-output
+        persistentVolumeClaim:
+          claimName: model-output-pvc
+
+---
+# Horovod Distributed Training
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: horovod-distributed-training
+  labels:
+    app: horovod-training
+    framework: horovod
+spec:
+  completions: 1
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: horovod-training
+        framework: horovod
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: horovod-worker
+        image: horovod/horovod:0.28.1-tf2.11.0-torch1.13.1-mxnet1.9.1-py3.8-cuda11.6
+        command: ["mpirun"]
+        args:
+          - "-np"
+          - "4"
+          - "--allow-run-as-root"
+          - "--host"
+          - "localhost:4"
+          - "-bind-to"
+          - "none"
+          - "-map-by"
+          - "slot"
+          - "-x"
+          - "NCCL_DEBUG=INFO"
+          - "-x"
+          - "LD_LIBRARY_PATH"
+          - "-x"
+          - "PATH"
+          - "python"
+          - "train_horovod.py"
+        resources:
+          requests:
+            nvidia.com/gpu: 4
+            memory: "64Gi"
+            cpu: "16"
+          limits:
+            nvidia.com/gpu: 4
+            memory: "128Gi"
+            cpu: "32"
+        volumeMounts:
+        - name: training-data
+          mountPath: /data
+        - name: model-output
+          mountPath: /models
+        - name: ssh-keys
+          mountPath: /root/.ssh
+      volumes:
+      - name: training-data
+        persistentVolumeClaim:
+          claimName: training-data-pvc
+      - name: model-output
+        persistentVolumeClaim:
+          claimName: model-output-pvc
+      - name: ssh-keys
+        secret:
+          secretName: ssh-keys
+          defaultMode: 0600
+
+---
+# Ray Train Distributed Training
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: ray-distributed-training
+  labels:
+    app: ray-training
+    framework: ray
+spec:
+  completions: 1
+  backoffLimit: 3
+  template:
+    metadata:
+      labels:
+        app: ray-training
+        framework: ray
+    spec:
+      restartPolicy: Never
+      containers:
+      - name: ray-head
+        image: rayproject/ray:2.8.0-gpu
+        command: ["ray", "start", "--head", "--dashboard-host=0.0.0.0"]
+        ports:
+        - containerPort: 8265  # Ray dashboard
+        - containerPort: 10001  # Ray client
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+            memory: "16Gi"
+            cpu: "4"
+          limits:
+            nvidia.com/gpu: 1
+            memory: "32Gi"
+            cpu: "8"
+        volumeMounts:
+        - name: training-data
+          mountPath: /data
+        - name: model-output
+          mountPath: /models
+      - name: ray-worker-1
+        image: rayproject/ray:2.8.0-gpu
+        command: ["ray", "start", "--address=localhost:10001"]
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+            memory: "16Gi"
+            cpu: "4"
+          limits:
+            nvidia.com/gpu: 1
+            memory: "32Gi"
+            cpu: "8"
+        volumeMounts:
+        - name: training-data
+          mountPath: /data
+        - name: model-output
+          mountPath: /models
+      - name: ray-worker-2
+        image: rayproject/ray:2.8.0-gpu
+        command: ["ray", "start", "--address=localhost:10001"]
+        resources:
+          requests:
+            nvidia.com/gpu: 1
+            memory: "16Gi"
+            cpu: "4"
+          limits:
+            nvidia.com/gpu: 1
+            memory: "32Gi"
+            cpu: "8"
+        volumeMounts:
+        - name: training-data
+          mountPath: /data
+        - name: model-output
+          mountPath: /models
+      volumes:
+      - name: training-data
+        persistentVolumeClaim:
+          claimName: training-data-pvc
+      - name: model-output
+        persistentVolumeClaim:
+          claimName: model-output-pvc
+
+---
+# Persistent Volume Claims for Training Data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: training-data-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 500Gi
+  storageClassName: fast-ssd
+
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-output-pvc
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 100Gi
+  storageClassName: fast-ssd
+
+---
+# Service for distributed training coordination
+apiVersion: v1
+kind: Service
+metadata:
+  name: training-coordinator
+spec:
+  selector:
+    app: distributed-training
+  ports:
+  - port: 23456
+    targetPort: 23456
+    name: pytorch-master
+  - port: 2222
+    targetPort: 2222
+    name: tensorflow-worker
+  - port: 8265
+    targetPort: 8265
+    name: ray-dashboard
+  clusterIP: None  # Headless service for DNS resolution
+
+---
+# ConfigMap for training scripts
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: training-scripts
+data:
+  train_distributed.py: |
+    import torch
+    import torch.distributed as dist
+    import torch.nn as nn
+    import torch.optim as optim
+    from torch.nn.parallel import DistributedDataParallel as DDP
+    import os
+    
+    def setup():
+        dist.init_process_group("nccl")
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    
+    def cleanup():
+        dist.destroy_process_group()
+    
+    def main():
+        setup()
+        
+        # Your training code here
+        model = nn.Linear(10, 1).cuda()
+        model = DDP(model)
+        
+        optimizer = optim.SGD(model.parameters(), lr=0.01)
+        
+        # Training loop
+        for epoch in range(100):
+            # Training step
+            pass
+            
+        cleanup()
+    
+    if __name__ == "__main__":
+        main()
+  
+  train_multiworker.py: |
+    import tensorflow as tf
+    import json
+    import os
+    
+    def main():
+        tf_config = json.loads(os.environ['TF_CONFIG'])
+        strategy = tf.distribute.MultiWorkerMirroredStrategy()
+        
+        with strategy.scope():
+            model = tf.keras.Sequential([
+                tf.keras.layers.Dense(128, activation='relu'),
+                tf.keras.layers.Dense(10, activation='softmax')
+            ])
+            
+            model.compile(
+                optimizer='adam',
+                loss='sparse_categorical_crossentropy',
+                metrics=['accuracy']
+            )
+        
+        # Training code here
+        # model.fit(dataset, epochs=10)
+    
+    if __name__ == "__main__":
+        main()
+  
+  train_horovod.py: |
+    import horovod.torch as hvd
+    import torch
+    import torch.nn as nn
+    
+    def main():
+        hvd.init()
+        torch.cuda.set_device(hvd.local_rank())
+        
+        model = nn.Linear(10, 1).cuda()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01 * hvd.size())
+        optimizer = hvd.DistributedOptimizer(optimizer)
+        
+        hvd.broadcast_parameters(model.state_dict(), root_rank=0)
+        hvd.broadcast_optimizer_state(optimizer, root_rank=0)
+        
+        # Training loop
+        for epoch in range(100):
+            # Training step
+            pass
+    
+    if __name__ == "__main__":
+        main() 
